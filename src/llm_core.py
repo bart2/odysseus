@@ -807,6 +807,17 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         calls = [_tc_acc[i] for i in sorted(_tc_acc)]
         return f'data: {json.dumps({"type": "tool_calls", "calls": calls})}\n\n'
 
+    # Diagnostic: capture request shape + response content so we can
+    # replay the exact failing payload when models produce garbage
+    # (e.g. Kimi-K2 emitting [PAD] storms). Logged at INFO so it shows
+    # in default container output; small footprint per call.
+    _dbg_msgs = payload.get("messages", []) or []
+    _dbg_last_user = next((m for m in reversed(_dbg_msgs) if m.get("role") == "user"), {})
+    _dbg_last_user_prev = str(_dbg_last_user.get("content", ""))[:120].replace("\n", "\\n")
+    _dbg_total_chars = sum(len(str(m.get("content", ""))) for m in _dbg_msgs)
+    logger.info(f"[stream-dbg] model={model} msgs={len(_dbg_msgs)} total_chars={_dbg_total_chars} last_user={_dbg_last_user_prev!r}")
+    _dbg_response = ""
+
     try:
         client = _get_http_client()
         async with client.stream('POST', target_url, json=payload, headers=h, timeout=stream_timeout) as r:
@@ -827,6 +838,16 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                         tc_event = _emit_tool_calls()
                         if tc_event:
                             yield tc_event
+                        _pad = _dbg_response.count("[PAD]")
+                        if _pad:
+                            logger.warning(f"[stream-dbg] PAD detected in response: count={_pad} chars={len(_dbg_response)} preview={_dbg_response[:200]!r}")
+                            try:
+                                _dump_path = f"/app/logs/pad_dump_{int(__import__('time').time())}.json"
+                                with open(_dump_path, "w") as f:
+                                    json.dump({"payload": payload, "response": _dbg_response}, f, indent=2)
+                                logger.warning(f"[stream-dbg] PAD payload dumped to {_dump_path}")
+                            except Exception as _e:
+                                logger.warning(f"[stream-dbg] PAD dump failed: {_e}")
                         yield "data: [DONE]\n\n"
                         return
 
@@ -857,9 +878,13 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                             if _thinking_model and not _first_content_sent and content.lstrip().lower().startswith("</think"):
                                                 content = "<think>" + content
                                             _first_content_sent = True
+                                            _dbg_response += content
                                             yield f'data: {json.dumps({"delta": content})}\n\n'
-                                        # Native tool calls — accumulate across chunks
-                                        for tc in delta.get("tool_calls", []):
+                                        # Native tool calls — accumulate across chunks.
+                                        # sglang sends "tool_calls": null on every chunk, so
+                                        # the default-[] fallback doesn't trigger — guard with
+                                        # `or []` to handle explicit null.
+                                        for tc in (delta.get("tool_calls") or []):
                                             idx = tc.get("index", 0)
                                             if idx not in _tc_acc:
                                                 _tc_acc[idx] = {"id": "", "name": "", "arguments": ""}
@@ -887,6 +912,18 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             tc_event = _emit_tool_calls()
             if tc_event:
                 yield tc_event
+            _pad = _dbg_response.count("[PAD]")
+            if _pad:
+                logger.warning(f"[stream-dbg] PAD detected in response: count={_pad} chars={len(_dbg_response)} preview={_dbg_response[:200]!r}")
+                # Dump the full request payload so we can replay it.
+                try:
+                    import os
+                    _dump_path = f"/app/logs/pad_dump_{int(__import__('time').time())}.json"
+                    with open(_dump_path, "w") as f:
+                        json.dump({"payload": payload, "response": _dbg_response}, f, indent=2)
+                    logger.warning(f"[stream-dbg] PAD payload dumped to {_dump_path}")
+                except Exception as _e:
+                    logger.warning(f"[stream-dbg] PAD dump failed: {_e}")
             yield "data: [DONE]\n\n"
 
     except (httpx.ConnectError, httpx.ConnectTimeout) as e:
