@@ -64,7 +64,29 @@ for cu in /app/.local/lib/python*/site-packages/nvidia/cu13; do
     fi
 done
 
+# Grant the dropped-to user access to a bind-mounted docker socket,
+# if one is present. The socket's GID inside the container is whatever
+# its owning group is on the host (often "docker", GID varies), which
+# usually does not correspond to any group in this image. Create a
+# matching group on the fly and add our user to it — gosu's
+# initgroups() below will then pick it up.
+if [ -S /var/run/docker.sock ]; then
+    DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)"
+    if ! getent group "$DOCKER_GID" >/dev/null 2>&1; then
+        groupadd -g "$DOCKER_GID" hostdocker
+    fi
+    DOCKER_GROUP="$(getent group "$DOCKER_GID" | cut -d: -f1)"
+    APP_USER="$(getent passwd "$PUID" | cut -d: -f1)"
+    usermod -aG "$DOCKER_GROUP" "$APP_USER"
+fi
+
 # Drop root and run the actual app. `gosu` is preferred over `su` /
 # `sudo` because it cleans up the process tree (no extra shell layer)
 # so signals (SIGTERM from `docker stop`) reach uvicorn directly.
-exec gosu "$PUID:$PGID" "$@"
+#
+# Pass just the uid (not "uid:gid"): with the numeric uid:gid form,
+# gosu skips initgroups() and the process ends up with no supplementary
+# groups — which silently breaks docker socket access (and anything
+# else relying on group membership). The primary GID is already set
+# correctly in /etc/passwd by the useradd above.
+exec gosu "$PUID" "$@"
